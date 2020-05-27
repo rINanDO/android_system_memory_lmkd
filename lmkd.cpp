@@ -42,6 +42,7 @@
 #include <cutils/properties.h>
 #include <cutils/sched_policy.h>
 #include <cutils/sockets.h>
+#include <liblmkd_utils.h>
 #include <lmkd.h>
 #include <log/log.h>
 #include <log/log_event_list.h>
@@ -128,8 +129,7 @@
  * System property defaults
  */
 /* ro.lmk.swap_free_low_percentage property defaults */
-#define DEF_LOW_SWAP_LOWRAM 10
-#define DEF_LOW_SWAP 20
+#define DEF_LOW_SWAP 10
 /* ro.lmk.thrashing_limit property defaults */
 #define DEF_THRASHING_LOWRAM 30
 #define DEF_THRASHING 100
@@ -141,6 +141,8 @@
 #define DEF_PARTIAL_STALL 70
 /* ro.lmk.psi_complete_stall_ms property defaults */
 #define DEF_COMPLETE_STALL 700
+
+#define LMKD_REINIT_PROP "lmkd.reinit"
 
 static inline int sys_pidfd_open(pid_t pid, unsigned int flags) {
     return syscall(__NR_pidfd_open, pid, flags);
@@ -200,6 +202,7 @@ static int psi_partial_stall_ms;
 static int psi_complete_stall_ms;
 static int thrashing_limit_pct;
 static int thrashing_limit_decay_pct;
+static int swap_util_max;
 static bool use_psi_monitors = false;
 static int kpoll_fd;
 static struct psi_threshold psi_thresholds[VMPRESS_LEVEL_COUNT] = {
@@ -213,7 +216,6 @@ static android_log_context ctx;
 enum polling_update {
     POLLING_DO_NOT_CHANGE,
     POLLING_START,
-    POLLING_STOP,
     POLLING_PAUSE,
     POLLING_RESUME,
 };
@@ -525,6 +527,10 @@ static uint32_t killcnt_total = 0;
 
 /* PAGE_SIZE / 1024 */
 static long page_k;
+
+static void update_props();
+static bool init_monitors();
+static void destroy_monitors();
 
 static int clamp(int low, int high, int value) {
     return max(min(value, high), low);
@@ -1364,6 +1370,7 @@ static void ctrl_command_handler(int dsock_idx) {
     int nargs;
     int targets;
     int kill_cnt;
+    int result;
 
     len = ctrl_data_read(dsock_idx, (char *)packet, CTRL_PACKET_MAX_SIZE, &cred);
     if (len <= 0)
@@ -1418,6 +1425,29 @@ static void ctrl_command_handler(int dsock_idx) {
     case LMK_PROCKILL:
         /* This command code is NOT expected at all */
         ALOGE("Received unexpected command code %d", cmd);
+        break;
+    case LMK_UPDATE_PROPS:
+        if (nargs != 0)
+            goto wronglen;
+        update_props();
+        if (!use_inkernel_interface) {
+            /* Reinitialize monitors to apply new settings */
+            destroy_monitors();
+            result = init_monitors() ? 0 : -1;
+        } else {
+            result = 0;
+        }
+        len = lmkd_pack_set_update_props_repl(packet, result);
+        if (ctrl_data_write(dsock_idx, (char *)packet, len) != len) {
+            ALOGE("Failed to report operation results");
+        }
+        if (!result) {
+            ALOGI("Properties reinitilized");
+        } else {
+            /* New settings can't be supported, crash to be restarted */
+            ALOGE("New configuration is not supported. Exiting...");
+            exit(1);
+        }
         break;
     default:
         ALOGE("Received unknown command code %d", cmd);
@@ -1923,9 +1953,9 @@ static void stop_wait_for_proc_kill(bool finished) {
 
     if (pidfd_supported) {
         /* unregister fd */
-        if (epoll_ctl(epollfd, EPOLL_CTL_DEL, last_kill_pid_or_fd, &epev) != 0) {
+        if (epoll_ctl(epollfd, EPOLL_CTL_DEL, last_kill_pid_or_fd, &epev)) {
+            // Log an error and keep going
             ALOGE("epoll_ctl for last killed process failed; errno=%d", errno);
-            return;
         }
         maxevents--;
         close(last_kill_pid_or_fd);
@@ -2094,7 +2124,6 @@ static int find_and_kill_process(int min_score_adj, int kill_reason, const char 
 }
 
 static int64_t get_memory_usage(struct reread_data *file_data) {
-    int ret;
     int64_t mem_usage;
     char *buf;
 
@@ -2202,6 +2231,13 @@ void calc_zone_watermarks(struct zoneinfo *zi, struct zone_watermarks *watermark
     }
 }
 
+static int calc_swap_utilization(union meminfo *mi) {
+    int64_t swap_used = mi->field.total_swap - mi->field.free_swap;
+    int64_t total_swappable = mi->field.active_anon + mi->field.inactive_anon +
+                              mi->field.shmem + swap_used;
+    return total_swappable > 0 ? (swap_used * 100) / total_swappable : 0;
+}
+
 static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_params) {
     enum kill_reasons {
         NONE = -1, /* To denote no kill condition */
@@ -2211,6 +2247,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         LOW_MEM_AND_SWAP,
         LOW_MEM_AND_THRASHING,
         DIRECT_RECL_AND_THRASHING,
+        LOW_MEM_AND_SWAP_UTIL,
         KILL_REASON_COUNT
     };
     enum reclaim_state {
@@ -2242,21 +2279,24 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     char kill_desc[LINE_MAX];
     bool cut_thrashing_limit = false;
     int min_score_adj = 0;
-
-    /* Skip while still killing a process */
-    if (is_kill_pending()) {
-        goto no_kill;
-    }
-    /*
-     * Process is dead, stop waiting. This has no effect if pidfds are supported and
-     * death notification already caused waiting to stop.
-     */
-    stop_wait_for_proc_kill(true);
+    int swap_util = 0;
 
     if (clock_gettime(CLOCK_MONOTONIC_COARSE, &curr_tm) != 0) {
         ALOGE("Failed to get current time");
         return;
     }
+
+    bool kill_pending = is_kill_pending();
+    if (kill_pending && (kill_timeout_ms == 0 ||
+        get_time_diff_ms(&last_kill_tm, &curr_tm) < static_cast<long>(kill_timeout_ms))) {
+        /* Skip while still killing a process */
+        goto no_kill;
+    }
+    /*
+     * Process is dead or kill timeout is over, stop waiting. This has no effect if pidfds are
+     * supported and death notification already caused waiting to stop.
+     */
+    stop_wait_for_proc_kill(!kill_pending);
 
     if (vmstat_parse(&vs) < 0) {
         ALOGE("Failed to parse vmstat!");
@@ -2356,12 +2396,30 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         snprintf(kill_desc, sizeof(kill_desc), "device is low on swap (%" PRId64
             "kB < %" PRId64 "kB) and thrashing (%" PRId64 "%%)",
             mi.field.free_swap * page_k, swap_low_threshold * page_k, thrashing);
+        /* Do not kill perceptible apps unless below min watermark */
+        if (wmark < WMARK_LOW) {
+            min_score_adj = PERCEPTIBLE_APP_ADJ + 1;
+        }
     } else if (swap_is_low && wmark < WMARK_HIGH) {
         /* Both free memory and swap are low */
         kill_reason = LOW_MEM_AND_SWAP;
         snprintf(kill_desc, sizeof(kill_desc), "%s watermark is breached and swap is low (%"
             PRId64 "kB < %" PRId64 "kB)", wmark > WMARK_LOW ? "min" : "low",
             mi.field.free_swap * page_k, swap_low_threshold * page_k);
+        /* Do not kill perceptible apps unless below min watermark */
+        if (wmark < WMARK_LOW) {
+            min_score_adj = PERCEPTIBLE_APP_ADJ + 1;
+        }
+    } else if (wmark < WMARK_HIGH && swap_util_max < 100 &&
+               (swap_util = calc_swap_utilization(&mi)) > swap_util_max) {
+        /*
+         * Too much anon memory is swapped out but swap is not low.
+         * Non-swappable allocations created memory pressure.
+         */
+        kill_reason = LOW_MEM_AND_SWAP_UTIL;
+        snprintf(kill_desc, sizeof(kill_desc), "%s watermark is breached and swap utilization"
+            " is high (%d%% > %d%%)", wmark > WMARK_LOW ? "min" : "low",
+            swap_util, swap_util_max);
     } else if (wmark < WMARK_HIGH && thrashing > thrashing_limit) {
         /* Page cache is thrashing while memory is low */
         kill_reason = LOW_MEM_AND_THRASHING;
@@ -2369,7 +2427,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
             PRId64 "%%)", wmark > WMARK_LOW ? "min" : "low", thrashing);
         cut_thrashing_limit = true;
         /* Do not kill perceptible apps because of thrashing */
-        min_score_adj = PERCEPTIBLE_APP_ADJ;
+        min_score_adj = PERCEPTIBLE_APP_ADJ + 1;
     } else if (reclaim == DIRECT_RECLAIM && thrashing > thrashing_limit) {
         /* Page cache is thrashing while in direct reclaim (mostly happens on lowram devices) */
         kill_reason = DIRECT_RECL_AND_THRASHING;
@@ -2377,7 +2435,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
             PRId64 "%%)", thrashing);
         cut_thrashing_limit = true;
         /* Do not kill perceptible apps because of thrashing */
-        min_score_adj = PERCEPTIBLE_APP_ADJ;
+        min_score_adj = PERCEPTIBLE_APP_ADJ + 1;
     }
 
     /* Kill a process if necessary */
@@ -2425,7 +2483,6 @@ no_kill:
 }
 
 static void mp_event_common(int data, uint32_t events, struct polling_params *poll_params) {
-    int ret;
     unsigned long long evcount;
     int64_t mem_usage, memsw_usage;
     int64_t mem_pressure;
@@ -2480,7 +2537,8 @@ static void mp_event_common(int data, uint32_t events, struct polling_params *po
         return;
     }
 
-    if (kill_timeout_ms && get_time_diff_ms(&last_kill_tm, &curr_tm) < kill_timeout_ms) {
+    if (kill_timeout_ms &&
+        get_time_diff_ms(&last_kill_tm, &curr_tm) < static_cast<long>(kill_timeout_ms)) {
         /*
          * If we're within the no-kill timeout, see if there's pending reclaim work
          * from the last killed process. If so, skip killing for now.
@@ -2688,10 +2746,15 @@ static bool init_mp_psi(enum vmpressure_level level, bool use_new_strategy) {
 static void destroy_mp_psi(enum vmpressure_level level) {
     int fd = mpevfd[level];
 
+    if (fd < 0) {
+        return;
+    }
+
     if (unregister_psi_monitor(epollfd, fd) < 0) {
         ALOGE("Failed to unregister psi monitor for %s memory pressure; errno=%d",
             level_name[level], errno);
     }
+    maxevents--;
     destroy_psi_monitor(fd);
     mpevfd[level] = -1;
 }
@@ -2794,9 +2857,58 @@ err_open_mpfd:
     return false;
 }
 
+static void destroy_mp_common(enum vmpressure_level level) {
+    struct epoll_event epev;
+    int fd = mpevfd[level];
+
+    if (fd < 0) {
+        return;
+    }
+
+    if (epoll_ctl(epollfd, EPOLL_CTL_DEL, fd, &epev)) {
+        // Log an error and keep going
+        ALOGE("epoll_ctl for level %s failed; errno=%d", level_name[level], errno);
+    }
+    maxevents--;
+    close(fd);
+    mpevfd[level] = -1;
+}
+
 static void kernel_event_handler(int data __unused, uint32_t events __unused,
                                  struct polling_params *poll_params __unused) {
     poll_kernel(kpoll_fd);
+}
+
+static bool init_monitors() {
+    /* Try to use psi monitor first if kernel has it */
+    use_psi_monitors = property_get_bool("ro.lmk.use_psi", true) &&
+        init_psi_monitors();
+    /* Fall back to vmpressure */
+    if (!use_psi_monitors &&
+        (!init_mp_common(VMPRESS_LEVEL_LOW) ||
+        !init_mp_common(VMPRESS_LEVEL_MEDIUM) ||
+        !init_mp_common(VMPRESS_LEVEL_CRITICAL))) {
+        ALOGE("Kernel does not support memory pressure events or in-kernel low memory killer");
+        return false;
+    }
+    if (use_psi_monitors) {
+        ALOGI("Using psi monitors for memory pressure detection");
+    } else {
+        ALOGI("Using vmpressure for memory pressure detection");
+    }
+    return true;
+}
+
+static void destroy_monitors() {
+    if (use_psi_monitors) {
+        destroy_mp_psi(VMPRESS_LEVEL_CRITICAL);
+        destroy_mp_psi(VMPRESS_LEVEL_MEDIUM);
+        destroy_mp_psi(VMPRESS_LEVEL_LOW);
+    } else {
+        destroy_mp_common(VMPRESS_LEVEL_CRITICAL);
+        destroy_mp_common(VMPRESS_LEVEL_MEDIUM);
+        destroy_mp_common(VMPRESS_LEVEL_LOW);
+    }
 }
 
 static int init(void) {
@@ -2866,21 +2978,8 @@ static int init(void) {
             }
         }
     } else {
-        /* Try to use psi monitor first if kernel has it */
-        use_psi_monitors = property_get_bool("ro.lmk.use_psi", true) &&
-            init_psi_monitors();
-        /* Fall back to vmpressure */
-        if (!use_psi_monitors &&
-            (!init_mp_common(VMPRESS_LEVEL_LOW) ||
-            !init_mp_common(VMPRESS_LEVEL_MEDIUM) ||
-            !init_mp_common(VMPRESS_LEVEL_CRITICAL))) {
-            ALOGE("Kernel does not support memory pressure events or in-kernel low memory killer");
+        if (!init_monitors()) {
             return -1;
-        }
-        if (use_psi_monitors) {
-            ALOGI("Using psi monitors for memory pressure detection");
-        } else {
-            ALOGI("Using vmpressure for memory pressure detection");
         }
         /* let the others know it does support reporting kills */
         property_set("sys.lmk.reportkills", "1");
@@ -2914,13 +3013,25 @@ static int init(void) {
     return 0;
 }
 
+static bool polling_paused(struct polling_params *poll_params) {
+    return poll_params->paused_handler != NULL;
+}
+
+static void resume_polling(struct polling_params *poll_params, struct timespec curr_tm) {
+    poll_params->poll_start_tm = curr_tm;
+    poll_params->poll_handler = poll_params->paused_handler;
+}
+
 static void call_handler(struct event_handler_info* handler_info,
                          struct polling_params *poll_params, uint32_t events) {
     struct timespec curr_tm;
 
+    poll_params->update = POLLING_DO_NOT_CHANGE;
     handler_info->handler(handler_info->data, events, poll_params);
     clock_gettime(CLOCK_MONOTONIC_COARSE, &curr_tm);
-    poll_params->last_poll_tm = curr_tm;
+    if (poll_params->poll_handler == handler_info) {
+        poll_params->last_poll_tm = curr_tm;
+    }
 
     switch (poll_params->update) {
     case POLLING_START:
@@ -2932,26 +3043,21 @@ static void call_handler(struct event_handler_info* handler_info,
         poll_params->poll_start_tm = curr_tm;
         poll_params->poll_handler = handler_info;
         break;
-    case POLLING_STOP:
-        poll_params->poll_handler = NULL;
-        break;
     case POLLING_PAUSE:
         poll_params->paused_handler = handler_info;
         poll_params->poll_handler = NULL;
         break;
     case POLLING_RESUME:
-        poll_params->poll_start_tm = curr_tm;
-        poll_params->poll_handler = poll_params->paused_handler;
+        resume_polling(poll_params, curr_tm);
         break;
     case POLLING_DO_NOT_CHANGE:
         if (get_time_diff_ms(&poll_params->poll_start_tm, &curr_tm) > PSI_WINDOW_SIZE_MS) {
             /* Polled for the duration of PSI window, time to stop */
             poll_params->poll_handler = NULL;
+            poll_params->paused_handler = NULL;
         }
-        /* WARNING: skipping the rest of the function */
-        return;
+        break;
     }
-    poll_params->update = POLLING_DO_NOT_CHANGE;
 }
 
 static void mainloop(void) {
@@ -2962,10 +3068,10 @@ static void mainloop(void) {
     long delay = -1;
 
     poll_params.poll_handler = NULL;
-    poll_params.update = POLLING_DO_NOT_CHANGE;
+    poll_params.paused_handler = NULL;
 
     while (1) {
-        struct epoll_event events[maxevents];
+        struct epoll_event events[MAX_EPOLL_EVENTS];
         int nevents;
         int i;
 
@@ -2999,8 +3105,23 @@ static void mainloop(void) {
                 call_handler(poll_params.poll_handler, &poll_params, 0);
             }
         } else {
-            /* Wait for events with no timeout */
-            nevents = epoll_wait(epollfd, events, maxevents, -1);
+            if (kill_timeout_ms && is_waiting_for_kill()) {
+                clock_gettime(CLOCK_MONOTONIC_COARSE, &curr_tm);
+                delay = kill_timeout_ms - get_time_diff_ms(&last_kill_tm, &curr_tm);
+                /* Wait for pidfds notification or kill timeout to expire */
+                nevents = (delay > 0) ? epoll_wait(epollfd, events, maxevents, delay) : 0;
+                if (nevents == 0) {
+                    /* Kill notification timed out */
+                    stop_wait_for_proc_kill(false);
+                    if (polling_paused(&poll_params)) {
+                        clock_gettime(CLOCK_MONOTONIC_COARSE, &curr_tm);
+                        resume_polling(&poll_params, curr_tm);
+                    }
+                }
+            } else {
+                /* Wait for events with no timeout */
+                nevents = epoll_wait(epollfd, events, maxevents, -1);
+            }
         }
 
         if (nevents == -1) {
@@ -3042,11 +3163,39 @@ static void mainloop(void) {
     }
 }
 
-int main(int argc __unused, char **argv __unused) {
-    struct sched_param param = {
-            .sched_priority = 1,
-    };
+int issue_reinit() {
+    int sock;
 
+    sock = lmkd_connect();
+    if (sock < 0) {
+        ALOGE("failed to connect to lmkd: %s", strerror(errno));
+        return -1;
+    }
+
+    enum update_props_result res = lmkd_update_props(sock);
+    switch (res) {
+    case UPDATE_PROPS_SUCCESS:
+        ALOGI("lmkd updated properties successfully");
+        break;
+    case UPDATE_PROPS_SEND_ERR:
+        ALOGE("failed to send lmkd request: %s", strerror(errno));
+        break;
+    case UPDATE_PROPS_RECV_ERR:
+        ALOGE("failed to receive lmkd reply: %s", strerror(errno));
+        break;
+    case UPDATE_PROPS_FORMAT_ERR:
+        ALOGE("lmkd reply is invalid");
+        break;
+    case UPDATE_PROPS_FAIL:
+        ALOGE("lmkd failed to update its properties");
+        break;
+    }
+
+    close(sock);
+    return res == UPDATE_PROPS_SUCCESS ? 0 : -1;
+}
+
+static void update_props() {
     /* By default disable low level vmpressure events */
     level_oomadj[VMPRESS_LEVEL_LOW] =
         property_get_int32("ro.lmk.low", OOM_SCORE_ADJ_MAX + 1);
@@ -3073,7 +3222,7 @@ int main(int argc __unused, char **argv __unused) {
     per_app_memcg =
         property_get_bool("ro.config.per_app_memcg", low_ram_device);
     swap_free_low_percentage = clamp(0, 100, property_get_int32("ro.lmk.swap_free_low_percentage",
-        low_ram_device ? DEF_LOW_SWAP_LOWRAM : DEF_LOW_SWAP));
+        DEF_LOW_SWAP));
     psi_partial_stall_ms = property_get_int32("ro.lmk.psi_partial_stall_ms",
         low_ram_device ? DEF_PARTIAL_STALL_LOWRAM : DEF_PARTIAL_STALL);
     psi_complete_stall_ms = property_get_int32("ro.lmk.psi_complete_stall_ms",
@@ -3082,6 +3231,18 @@ int main(int argc __unused, char **argv __unused) {
         low_ram_device ? DEF_THRASHING_LOWRAM : DEF_THRASHING));
     thrashing_limit_decay_pct = clamp(0, 100, property_get_int32("ro.lmk.thrashing_limit_decay",
         low_ram_device ? DEF_THRASHING_DECAY_LOWRAM : DEF_THRASHING_DECAY));
+    swap_util_max = clamp(0, 100, property_get_int32("ro.lmk.swap_util_max", 100));
+}
+
+int main(int argc, char **argv) {
+    if ((argc > 1) && argv[1] && !strcmp(argv[1], "--reinit")) {
+        if (property_set(LMKD_REINIT_PROP, "0")) {
+            ALOGE("Failed to reset " LMKD_REINIT_PROP " property");
+        }
+        return issue_reinit();
+    }
+
+    update_props();
 
     ctx = create_android_logger(KILLINFO_LOG_TAG);
 
@@ -3104,6 +3265,9 @@ int main(int argc __unused, char **argv __unused) {
             }
 
             /* CAP_NICE required */
+            struct sched_param param = {
+                    .sched_priority = 1,
+            };
             if (sched_setscheduler(0, SCHED_FIFO, &param)) {
                 ALOGW("set SCHED_FIFO failed %s", strerror(errno));
             }
