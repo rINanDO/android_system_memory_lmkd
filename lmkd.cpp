@@ -100,6 +100,7 @@
 #define EIGHT_MEGA (1 << 23)
 
 #define TARGET_UPDATE_MIN_INTERVAL_MS 1000
+#define THRASHING_RESET_INTERVAL_MS 1000
 
 #define NS_PER_MS (NS_PER_SEC / MS_PER_SEC)
 #define US_PER_MS (US_PER_SEC / MS_PER_SEC)
@@ -799,8 +800,16 @@ static void poll_kernel(int poll_fd) {
             ctrl_data_write_lmk_kill_occurred((pid_t)pid, (uid_t)uid);
             mem_st.process_start_time_ns = starttime * (NS_PER_SEC / sysconf(_SC_CLK_TCK));
             mem_st.rss_in_bytes = rss_in_pages * PAGE_SIZE;
-            stats_write_lmk_kill_occurred_pid(uid, pid, oom_score_adj,
-                                              min_score_adj, &mem_st);
+
+            struct kill_stat kill_st = {
+                .uid = static_cast<int32_t>(uid),
+                .kill_reason = NONE,
+                .oom_score = oom_score_adj,
+                .min_oom_score = min_score_adj,
+                .free_mem_kb = 0,
+                .free_swap_kb = 0,
+            };
+            stats_write_lmk_kill_occurred_pid(pid, &kill_st, &mem_st);
         }
 
         free(taskname);
@@ -2044,7 +2053,7 @@ static void start_wait_for_proc_kill(int pid_or_fd) {
 }
 
 /* Kill one process specified by procp.  Returns the size (in pages) of the process killed */
-static int kill_one_process(struct proc* procp, int min_oom_score, int kill_reason,
+static int kill_one_process(struct proc* procp, int min_oom_score, enum kill_reasons kill_reason,
                             const char *kill_desc, union meminfo *mi, struct wakeup_info *wi,
                             struct timespec *tm) {
     int pid = procp->pid;
@@ -2054,6 +2063,7 @@ static int kill_one_process(struct proc* procp, int min_oom_score, int kill_reas
     int r;
     int result = -1;
     struct memory_stat *mem_st;
+    struct kill_stat kill_st;
     int64_t tgid;
     int64_t rss_kb;
     int64_t swap_kb;
@@ -2122,7 +2132,14 @@ static int kill_one_process(struct proc* procp, int min_oom_score, int kill_reas
               uid, procp->oomadj, rss_kb);
     }
 
-    stats_write_lmk_kill_occurred(uid, taskname, procp->oomadj, min_oom_score, mem_st);
+    kill_st.uid = static_cast<int32_t>(uid);
+    kill_st.taskname = taskname;
+    kill_st.kill_reason = kill_reason;
+    kill_st.oom_score = procp->oomadj;
+    kill_st.min_oom_score = min_oom_score;
+    kill_st.free_mem_kb = mi->field.nr_free_pages * page_k;
+    kill_st.free_swap_kb = mi->field.free_swap * page_k;
+    stats_write_lmk_kill_occurred(&kill_st, mem_st);
 
     ctrl_data_write_lmk_kill_occurred((pid_t)pid, uid);
 
@@ -2141,8 +2158,9 @@ out:
  * Find one process to kill at or above the given oom_adj level.
  * Returns size of the killed process.
  */
-static int find_and_kill_process(int min_score_adj, int kill_reason, const char *kill_desc,
-                                 union meminfo *mi, struct wakeup_info *wi, struct timespec *tm) {
+static int find_and_kill_process(int min_score_adj, enum kill_reasons kill_reason,
+                                 const char *kill_desc, union meminfo *mi,
+                                 struct wakeup_info *wi, struct timespec *tm) {
     int i;
     int killed_size = 0;
     bool lmk_state_change_start = false;
@@ -2296,33 +2314,24 @@ static int calc_swap_utilization(union meminfo *mi) {
 }
 
 static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_params) {
-    enum kill_reasons {
-        NONE = -1, /* To denote no kill condition */
-        PRESSURE_AFTER_KILL = 0,
-        NOT_RESPONDING,
-        LOW_SWAP_AND_THRASHING,
-        LOW_MEM_AND_SWAP,
-        LOW_MEM_AND_THRASHING,
-        DIRECT_RECL_AND_THRASHING,
-        LOW_MEM_AND_SWAP_UTIL,
-        KILL_REASON_COUNT
-    };
     enum reclaim_state {
         NO_RECLAIM = 0,
         KSWAPD_RECLAIM,
         DIRECT_RECLAIM,
     };
     static int64_t init_ws_refault;
+    static int64_t prev_workingset_refault;
     static int64_t base_file_lru;
     static int64_t init_pgscan_kswapd;
     static int64_t init_pgscan_direct;
     static int64_t swap_low_threshold;
     static bool killing;
-    static int thrashing_limit;
-    static bool in_reclaim;
+    static int thrashing_limit = thrashing_limit_pct;
     static struct zone_watermarks watermarks;
     static struct timespec wmark_update_tm;
     static struct wakeup_info wi;
+    static struct timespec thrashing_reset_tm;
+    static int64_t prev_thrash_growth = 0;
 
     union meminfo mi;
     union vmstat vs;
@@ -2338,6 +2347,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     bool cut_thrashing_limit = false;
     int min_score_adj = 0;
     int swap_util = 0;
+    long since_thrashing_reset_ms;
 
     if (clock_gettime(CLOCK_MONOTONIC_COARSE, &curr_tm) != 0) {
         ALOGE("Failed to get current time");
@@ -2376,6 +2386,8 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         /* Reset file-backed pagecache size and refault amounts after a kill */
         base_file_lru = vs.field.nr_inactive_file + vs.field.nr_active_file;
         init_ws_refault = vs.field.workingset_refault;
+        thrashing_reset_tm = curr_tm;
+        prev_thrash_growth = 0;
     }
 
     /* Check free swap levels */
@@ -2394,22 +2406,51 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     } else if (vs.field.pgscan_kswapd > init_pgscan_kswapd) {
         init_pgscan_kswapd = vs.field.pgscan_kswapd;
         reclaim = KSWAPD_RECLAIM;
-    } else {
-        in_reclaim = false;
-        /* Skip if system is not reclaiming */
+    } else if (vs.field.workingset_refault == prev_workingset_refault) {
+        /* Device is not thrashing and not reclaiming, bail out early until we see these stats changing*/
         goto no_kill;
     }
 
-    if (!in_reclaim) {
-        /* Record file-backed pagecache size when entering reclaim cycle */
+    prev_workingset_refault = vs.field.workingset_refault;
+
+     /*
+     * It's possible we fail to find an eligible process to kill (ex. no process is
+     * above oom_adj_min). When this happens, we should retry to find a new process
+     * for a kill whenever a new eligible process is available. This is especially
+     * important for a slow growing refault case. While retrying, we should keep
+     * monitoring new thrashing counter as someone could release the memory to mitigate
+     * the thrashing. Thus, when thrashing reset window comes, we decay the prev thrashing
+     * counter by window counts. if the counter is still greater than thrashing limit,
+     * we preserve the current prev_thrash counter so we will retry kill again. Otherwise,
+     * we reset the prev_thrash counter so we will stop retrying.
+     */
+    since_thrashing_reset_ms = get_time_diff_ms(&thrashing_reset_tm, &curr_tm);
+    if (since_thrashing_reset_ms > THRASHING_RESET_INTERVAL_MS) {
+        long windows_passed;
+        /* Calculate prev_thrash_growth if we crossed THRASHING_RESET_INTERVAL_MS */
+        prev_thrash_growth = (vs.field.workingset_refault - init_ws_refault) * 100
+                            / (base_file_lru + 1);
+        windows_passed = (since_thrashing_reset_ms / THRASHING_RESET_INTERVAL_MS);
+        /*
+         * Decay prev_thrashing unless over-the-limit thrashing was registered in the window we
+         * just crossed, which means there were no eligible processes to kill. We preserve the
+         * counter in that case to ensure a kill if a new eligible process appears.
+         */
+        if (windows_passed > 1 || prev_thrash_growth < thrashing_limit) {
+            prev_thrash_growth >>= windows_passed;
+        }
+
+        /* Record file-backed pagecache size when crossing THRASHING_RESET_INTERVAL_MS */
         base_file_lru = vs.field.nr_inactive_file + vs.field.nr_active_file;
         init_ws_refault = vs.field.workingset_refault;
+        thrashing_reset_tm = curr_tm;
         thrashing_limit = thrashing_limit_pct;
     } else {
         /* Calculate what % of the file-backed pagecache refaulted so far */
-        thrashing = (vs.field.workingset_refault - init_ws_refault) * 100 / base_file_lru;
+        thrashing = (vs.field.workingset_refault - init_ws_refault) * 100 / (base_file_lru + 1);
     }
-    in_reclaim = true;
+    /* Add previous cycle's decayed thrashing amount */
+    thrashing += prev_thrash_growth;
 
     /*
      * Refresh watermarks once per min in case user updated one of the margins.
@@ -2426,7 +2467,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
 
         calc_zone_watermarks(&zi, &watermarks);
         wmark_update_tm = curr_tm;
-     }
+    }
 
     /* Find out which watermark is breached if any */
     wmark = get_lowest_watermark(&mi, &watermarks);
@@ -2721,7 +2762,7 @@ static void mp_event_common(int data, uint32_t events, struct polling_params *po
 do_kill:
     if (low_ram_device) {
         /* For Go devices kill only one task */
-        if (find_and_kill_process(level_oomadj[level], -1, NULL, &mi, &wi, &curr_tm) == 0) {
+        if (find_and_kill_process(level_oomadj[level], NONE, NULL, &mi, &wi, &curr_tm) == 0) {
             if (debug_process_killing) {
                 ALOGI("Nothing to kill");
             }
@@ -2744,7 +2785,7 @@ do_kill:
             min_score_adj = level_oomadj[level];
         }
 
-        pages_freed = find_and_kill_process(min_score_adj, -1, NULL, &mi, &wi, &curr_tm);
+        pages_freed = find_and_kill_process(min_score_adj, NONE, NULL, &mi, &wi, &curr_tm);
 
         if (pages_freed == 0) {
             /* Rate limit kill reports when nothing was reclaimed */
@@ -3085,6 +3126,8 @@ static bool polling_paused(struct polling_params *poll_params) {
 static void resume_polling(struct polling_params *poll_params, struct timespec curr_tm) {
     poll_params->poll_start_tm = curr_tm;
     poll_params->poll_handler = poll_params->paused_handler;
+    poll_params->polling_interval_ms = PSI_POLL_PERIOD_SHORT_MS;
+    poll_params->paused_handler = NULL;
 }
 
 static void call_handler(struct event_handler_info* handler_info,
@@ -3119,7 +3162,6 @@ static void call_handler(struct event_handler_info* handler_info,
         if (get_time_diff_ms(&poll_params->poll_start_tm, &curr_tm) > PSI_WINDOW_SIZE_MS) {
             /* Polled for the duration of PSI window, time to stop */
             poll_params->poll_handler = NULL;
-            poll_params->paused_handler = NULL;
         }
         break;
     }
@@ -3144,12 +3186,8 @@ static void mainloop(void) {
             bool poll_now;
 
             clock_gettime(CLOCK_MONOTONIC_COARSE, &curr_tm);
-            if (poll_params.poll_handler == poll_params.paused_handler) {
-                /*
-                 * Just transitioned into POLLING_RESUME. Reset paused_handler
-                 * and poll immediately
-                 */
-                poll_params.paused_handler = NULL;
+            if (poll_params.update == POLLING_RESUME) {
+                /* Just transitioned into POLLING_RESUME, poll immediately. */
                 poll_now = true;
                 nevents = 0;
             } else {
@@ -3180,6 +3218,7 @@ static void mainloop(void) {
                     stop_wait_for_proc_kill(false);
                     if (polling_paused(&poll_params)) {
                         clock_gettime(CLOCK_MONOTONIC_COARSE, &curr_tm);
+                        poll_params.update = POLLING_RESUME;
                         resume_polling(&poll_params, curr_tm);
                     }
                 }
