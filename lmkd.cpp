@@ -47,6 +47,7 @@
 #include <log/log.h>
 #include <log/log_event_list.h>
 #include <log/log_time.h>
+#include <private/android_filesystem_config.h>
 #include <psi/psi.h>
 #include <system/thread_defs.h>
 
@@ -244,6 +245,7 @@ struct event_handler_info {
 /* data required to handle socket events */
 struct sock_event_handler_info {
     int sock;
+    pid_t pid;
     uint32_t async_event_mask;
     struct event_handler_info handler_info;
 };
@@ -495,6 +497,7 @@ struct proc {
     int pidfd;
     uid_t uid;
     int oomadj;
+    pid_t reg_pid; /* PID of the process that registered this record */
     struct proc *pidhash_next;
 };
 
@@ -644,6 +647,34 @@ static char *reread_file(struct reread_data *data) {
     return buf;
 }
 
+static bool claim_record(struct proc* procp, pid_t pid) {
+    if (procp->reg_pid == pid) {
+        /* Record already belongs to the registrant */
+        return true;
+    }
+    if (procp->reg_pid == 0) {
+        /* Old registrant is gone, claim the record */
+        procp->reg_pid = pid;
+        return true;
+    }
+    /* The record is owned by another registrant */
+    return false;
+}
+
+static void remove_claims(pid_t pid) {
+    int i;
+
+    for (i = 0; i < PIDHASH_SZ; i++) {
+        struct proc* procp = pidhash[i];
+        while (procp) {
+            if (procp->reg_pid == pid) {
+                procp->reg_pid = 0;
+            }
+            procp = procp->pidhash_next;
+        }
+    }
+}
+
 static void ctrl_data_close(int dsock_idx) {
     struct epoll_event epev;
 
@@ -656,20 +687,49 @@ static void ctrl_data_close(int dsock_idx) {
 
     close(data_sock[dsock_idx].sock);
     data_sock[dsock_idx].sock = -1;
+
+    /* Mark all records of the old registrant as unclaimed */
+    remove_claims(data_sock[dsock_idx].pid);
 }
 
-static ssize_t ctrl_data_read(int dsock_idx, char* buf, size_t bufsz) {
-    int ret = 0;
-
-    ret = TEMP_FAILURE_RETRY(read(data_sock[dsock_idx].sock, buf, bufsz));
-    
+static ssize_t ctrl_data_read(int dsock_idx, char* buf, size_t bufsz, struct ucred* sender_cred) {
+    struct iovec iov = {buf, bufsz};
+    char control[CMSG_SPACE(sizeof(struct ucred))];
+    struct msghdr hdr = {
+            NULL, 0, &iov, 1, control, sizeof(control), 0,
+    };
+    ssize_t ret;
+    ret = TEMP_FAILURE_RETRY(recvmsg(data_sock[dsock_idx].sock, &hdr, 0));
     if (ret == -1) {
-        ALOGE("control data socket read failed; errno=%d", errno);
+        ALOGE("control data socket read failed; %s", strerror(errno));
         return -1;
-    } else if (ret == 0) {
-        ALOGE("Got EOF on control data socket");
-        ret = -1;
     }
+    if (ret == 0) {
+        ALOGE("Got EOF on control data socket");
+        return -1;
+    }
+
+    struct ucred* cred = NULL;
+    struct cmsghdr* cmsg = CMSG_FIRSTHDR(&hdr);
+    while (cmsg != NULL) {
+        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_CREDENTIALS) {
+            cred = (struct ucred*)CMSG_DATA(cmsg);
+            break;
+        }
+        cmsg = CMSG_NXTHDR(&hdr, cmsg);
+    }
+
+    if (cred == NULL) {
+        ALOGE("Failed to retrieve sender credentials");
+        /* Close the connection */
+        ctrl_data_close(dsock_idx);
+        return -1;
+    }
+
+    memcpy(sender_cred, cred, sizeof(struct ucred));
+
+    /* Store PID of the peer */
+    data_sock[dsock_idx].pid = cred->pid;
 
     return ret;
 }
@@ -977,7 +1037,7 @@ static char *proc_get_name(int pid, char *buf, size_t buf_size) {
     return buf;
 }
 
-static void cmd_procprio(LMKD_CTRL_PACKET packet, int field_count) {
+static void cmd_procprio(LMKD_CTRL_PACKET packet, int field_count, struct ucred *cred) {
     struct proc *procp;
     char path[LINE_MAX];
     char val[20];
@@ -1091,17 +1151,26 @@ static void cmd_procprio(LMKD_CTRL_PACKET packet, int field_count) {
         procp->pid = params.pid;
         procp->pidfd = pidfd;
         procp->uid = params.uid;
+        procp->reg_pid = cred->pid;
         procp->oomadj = params.oomadj;
         proc_insert(procp);
     } else {
+        if (!claim_record(procp, cred->pid)) {
+            char buf[LINE_MAX];
+            /* Only registrant of the record can remove it */
+            ALOGE("%s (%d, %d) attempts to modify a process registered by another client",
+                proc_get_name(cred->pid, buf, sizeof(buf)), cred->uid, cred->pid);
+            return;
+        }
         proc_unslot(procp);
         procp->oomadj = params.oomadj;
         proc_slot(procp);
     }
 }
 
-static void cmd_procremove(LMKD_CTRL_PACKET packet) {
+static void cmd_procremove(LMKD_CTRL_PACKET packet, struct ucred *cred) {
     struct lmk_procremove params;
+    struct proc *procp;
 
     lmkd_pack_get_procremove(packet, &params);
 
@@ -1118,6 +1187,19 @@ static void cmd_procremove(LMKD_CTRL_PACKET packet) {
         return;
     }
 
+    procp = pid_lookup(params.pid);
+    if (!procp) {
+        return;
+    }
+
+    if (!claim_record(procp, cred->pid)) {
+        char buf[LINE_MAX];
+        /* Only registrant of the record can remove it */
+        ALOGE("%s (%d, %d) attempts to unregister a process registered by another client",
+            proc_get_name(cred->pid, buf, sizeof(buf)), cred->uid, cred->pid);
+        return;
+    }
+
     /*
      * WARNING: After pid_remove() procp is freed and can't be used!
      * Therefore placed at the end of the function.
@@ -1125,7 +1207,7 @@ static void cmd_procremove(LMKD_CTRL_PACKET packet) {
     pid_remove(params.pid);
 }
 
-static void cmd_procpurge() {
+static void cmd_procpurge(struct ucred *cred) {
     int i;
     struct proc *procp;
     struct proc *next;
@@ -1135,20 +1217,17 @@ static void cmd_procpurge() {
         return;
     }
 
-    for (i = 0; i <= ADJTOSLOT(OOM_SCORE_ADJ_MAX); i++) {
-        procadjslot_list[i].next = &procadjslot_list[i];
-        procadjslot_list[i].prev = &procadjslot_list[i];
-    }
-
     for (i = 0; i < PIDHASH_SZ; i++) {
         procp = pidhash[i];
         while (procp) {
             next = procp->pidhash_next;
-            free(procp);
+            /* Purge only records created by the requestor */
+            if (claim_record(procp, cred->pid)) {
+                pid_remove(procp->pid);
+            }
             procp = next;
         }
     }
-    memset(&pidhash[0], 0, sizeof(pidhash));
 }
 
 static void cmd_subscribe(int dsock_idx, LMKD_CTRL_PACKET packet) {
@@ -1296,6 +1375,7 @@ static void cmd_target(int ntargets, LMKD_CTRL_PACKET packet) {
 
 static void ctrl_command_handler(int dsock_idx) {
     LMKD_CTRL_PACKET packet;
+    struct ucred cred;
     int len;
     enum lmk_cmd cmd;
     int nargs;
@@ -1303,7 +1383,7 @@ static void ctrl_command_handler(int dsock_idx) {
     int kill_cnt;
     int result;
 
-    len = ctrl_data_read(dsock_idx, (char *)packet, CTRL_PACKET_MAX_SIZE);
+    len = ctrl_data_read(dsock_idx, (char *)packet, CTRL_PACKET_MAX_SIZE, &cred);
     if (len <= 0)
         return;
 
@@ -1328,17 +1408,17 @@ static void ctrl_command_handler(int dsock_idx) {
         /* process type field is optional for backward compatibility */
         if (nargs < 3 || nargs > 4)
             goto wronglen;
-        cmd_procprio(packet, nargs);
+        cmd_procprio(packet, nargs, &cred);
         break;
     case LMK_PROCREMOVE:
         if (nargs != 1)
             goto wronglen;
-        cmd_procremove(packet);
+        cmd_procremove(packet, &cred);
         break;
     case LMK_PROCPURGE:
         if (nargs != 0)
             goto wronglen;
-        cmd_procpurge();
+        cmd_procpurge(&cred);
         break;
     case LMK_GETKILLCNT:
         if (nargs != 2)
